@@ -15,7 +15,7 @@ image_size = (1, 28, 28)
 image_size_int = torch.prod(torch.tensor(image_size), dtype=torch.int32).item()
 # 10个数字需要区分
 mnist_discrimination_number = 10
-num_epoch = 500
+num_epoch = 1000
 batch_size = 40
 latent_dim = 100
 epsilon_gan = 0.01
@@ -110,19 +110,19 @@ discriminator = Discriminator().to(device)
 train_option = input("(L)oad previous model or (T)rain a new model? or (G)enerate images?")
 start_epoch = 0
 if train_option == "L" or train_option == "l":
-    generator.load_state_dict(torch.load("./GAN_results_ckpt/generator.pth"))
-    discriminator.load_state_dict(torch.load("./GAN_results_ckpt/discriminator.pth"))
+    generator.load_state_dict(torch.load("./GAN_data/GAN_results_ckpt/generator.pth"))
+    discriminator.load_state_dict(torch.load("./GAN_data/GAN_results_ckpt/discriminator.pth"))
     start_epoch = input("Load previous model successfully! The previous epoch number: ")
     start_epoch = int(start_epoch)
 elif train_option == "T" or train_option == "t":
     print("Start training a new model!")
 elif train_option == "G" or train_option == "g":
-    generator.load_state_dict(torch.load("./GAN_results_ckpt/generator.pth"))
+    generator.load_state_dict(torch.load("./GAN_data/GAN_results_ckpt/generator.pth"))
     generate_img_option = input("Generate Image number: ")
     generate_img_option = int(generate_img_option)
     z_gen = torch.randn(generate_img_option, latent_dim).to(device)
     generated_image = generator(z_gen)
-    torchvision.utils.save_image(generated_image, f"./GAN_generate/image_gen_{generate_img_option}.png")
+    torchvision.utils.save_image(generated_image, f"./GAN_data/GAN_generate/image_gen_{generate_img_option}.png")
     exit(0)
 else:
     print("Invalid input!")
@@ -192,25 +192,25 @@ for index_epoch in range(start_epoch + 1, num_epoch):
     loss_d_avg = torch.mean(torch.FloatTensor(loss_d_list))
     gen_image_final = generator(torch.randn(batch_size, latent_dim).to(device))
     print(f"epoch [{index_epoch}/{num_epoch}] gen_loss:{loss_g_avg}, dis_loss:{loss_d_avg}")
-    torchvision.utils.save_image(gen_image_final, f"./GAN_results/image_gen_{index_epoch}.png")
+    torchvision.utils.save_image(gen_image_final, f"./GAN_data/GAN_results/image_gen_{index_epoch}.png")
     if os.path.exists("stop_gan.txt"):
         abort_option = input("stop_gan.txt detected, (S)ave model and exit, (C)ontinue training, (SC) Save and "
                              "Continue training")
         if abort_option == "S" or abort_option == "s" or abort_option == "SC" or abort_option == "sc":
-            torch.save(generator.state_dict(), "./GAN_results_ckpt/generator.pth")
-            torch.save(discriminator.state_dict(), "./GAN_results_ckpt/discriminator.pth")
+            torch.save(generator.state_dict(), "./GAN_data/GAN_results_ckpt/generator.pth")
+            torch.save(discriminator.state_dict(), "./GAN_data/GAN_results_ckpt/discriminator.pth")
             if abort_option == "S" or abort_option == "s":
                 break
     if abs(loss_d_avg - 0.5) < epsilon_gan:
         stop_counter += 1
         if stop_counter == stop_count:
             print("Multiple epoch trained meet requirement(loss_g approx 0.5), stopping training")
-            torch.save(generator.state_dict(), "./GAN_results_ckpt/generator.pth")
-            torch.save(discriminator.state_dict(), "./GAN_results_ckpt/discriminator.pth")
+            torch.save(generator.state_dict(), "./GAN_data/GAN_results_ckpt/generator.pth")
+            torch.save(discriminator.state_dict(), "./GAN_data/GAN_results_ckpt/discriminator.pth")
             break
     else:
         stop_counter = 0
 
 
-torch.save(generator.state_dict(), "./GAN_results_ckpt/generator.pth")
-torch.save(discriminator.state_dict(), "./GAN_results_ckpt/discriminator.pth")
+torch.save(generator.state_dict(), "./GAN_data/GAN_results_ckpt/generator.pth")
+torch.save(discriminator.state_dict(), "./GAN_data/GAN_results_ckpt/discriminator.pth")

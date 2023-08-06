@@ -175,7 +175,7 @@ def ResNet152(image_channels=3, num_classes=1000):
     return ResNet(resblock=ResBlock, layers=[3, 8, 36, 3], image_channels=image_channels, num_classes=num_classes)
 
 
-def test():
+def test_network():
     net = ResNet152().to(device)
     # (number_images, image_channels, height, width)
     x = torch.randn((10, 3, 300, 224)).to(device)
@@ -183,4 +183,6 @@ def test():
     print(y.shape)
 
 
-test()
+test_network()
+
+# train

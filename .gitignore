@@ -1,4 +1,6 @@
 /GAN_data/
 /venv/
 /mnist_data/
-/.idea
+/.idea/
+/ResNet_data/fruit_vegetable_raw_data/
+/ResNet_data/fruit_vegetable_data_224/

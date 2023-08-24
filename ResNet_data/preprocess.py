@@ -30,7 +30,7 @@ def preprocess():
     image_transform = None
     if resize_size is not None:
         image_transform = transforms.Compose([
-            transforms.Resize(resize_size),
+            transforms.Resize((resize_size, resize_size)),
             # transforms.ToTensor()
         ])
     else:
@@ -100,4 +100,4 @@ def mean_std():
 
 
 if __name__ == '__main__':
-    mean_std()
+    preprocess()

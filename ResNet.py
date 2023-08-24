@@ -3,14 +3,40 @@
 # 这样做的好处是防止梯度消失，因为在生成深度神经网络的时候由于链式法则，梯度会一路乘下去 grad_deep = grad_add * grad_shallow
 # 而如果使用ResNet就使得grad_deep = grad_deep(=grad_add*grad_shallow) + grad_shallow，梯度不会消失(grad_shallow通常较大)
 # 使得训练收敛更快，也能有效方式过拟合（深度网络的深层部分若冗余，则会自发构建identity map，能够fallback到浅层网络）
-
-
+import os
 import torch
 import torch.nn as nn
+import torch.utils.data
+import torch.utils.tensorboard
+import torch.cuda.amp
+import torchvision.transforms
+import timm.utils
 from torchsummary import summary  # summary(model, input_shape)
 
 default_expansion = 4
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+resize_size = 224
+img_channels = 3
+resnet_ver = 50
+dataset_path = './ResNet_data/fruit_vegetable_data_224'
+log_path = './ResNet_data/logs'
+log_step = 5
+batch_size = 100
+# 会被构建dataset的时候计算出来
+num_categories = None
+# num_workers参数决定了有多少个子进程被用来加载数据。
+# 如果num_workers=0，则数据将在主进程中加载，这可能会阻塞主进程的其他操作。
+# 如果num_workers大于0，数据加载就会由这些子进程完成，可以在后台并行进行，大大提高了数据加载的速度。
+num_workers = 10
+# pin_memory是一个布尔类型的参数，如果设置为True，DataLoader会在返回之前，将张量复制到CUDA固定内存(也称作pinned内存)中。
+# 默认情况下，当你把一个在CPU上的Tensor送入GPU的时候，PyTorch总是会首先把它复制到一个pinned内存的buffer
+# 然后CUDA才从那里异步的把它发送到GPU。如果你的数据在一开始就已经保存在pinned内存中了，那么这个额外的复制就可以被避免
+# 从而可能会加速模型训练。
+pin_memory = True
+learn_rate = 0.01
+# 就是IML课里学的例如Lasso或者Ridge回归的L2正则项的lambda系数
+weight_decay = 0.001
+num_epoch = 300
 
 
 # ResNet50的ResBlock其实非常简单
@@ -163,16 +189,22 @@ class ResNet(nn.Module):
         return nn.Sequential(*layers)
 
 
-def ResNet50(image_channels=3, num_classes=1000):
+def ResNet50(image_channels=3, num_classes=1000) -> ResNet:
     return ResNet(resblock=ResBlock, layers=[3, 4, 6, 3], image_channels=image_channels, num_classes=num_classes)
 
 
-def ResNet101(image_channels=3, num_classes=1000):
+def ResNet101(image_channels=3, num_classes=1000) -> ResNet:
     return ResNet(resblock=ResBlock, layers=[3, 4, 23, 3], image_channels=image_channels, num_classes=num_classes)
 
 
-def ResNet152(image_channels=3, num_classes=1000):
+def ResNet152(image_channels=3, num_classes=1000) -> ResNet:
     return ResNet(resblock=ResBlock, layers=[3, 8, 36, 3], image_channels=image_channels, num_classes=num_classes)
+
+
+def ResNetCustomize(image_channels=3, num_classes=1000, layers=None) -> ResNet:
+    if layers is None:
+        layers = [3, 8, 36, 3]
+    return ResNet(resblock=ResBlock, layers=layers, image_channels=image_channels, num_classes=num_classes)
 
 
 def test_network():
@@ -183,6 +215,214 @@ def test_network():
     print(y.shape)
 
 
-test_network()
+# 训练部分
+def build_transform(is_train) -> torchvision.transforms:
+    """
+    针对不同的运算模式，构建不同的图像预处理transform
+    """
+    transform = None
+    if is_train:
+        transform = torchvision.transforms.Compose([
+            torchvision.transforms.Resize(resize_size),
+            # 训练的时候，图像数据增强
+            torchvision.transforms.RandomHorizontalFlip(),
+            torchvision.transforms.RandomVerticalFlip(),
+            # 这个函数将会生成一个四点透视变换，并用随机生成的值调整图像的四个角。
+            # 四点透视变换是将图像的四个角移动到新的位置以创建一个新的视角。
+            # 这种方法主要用于图像增强和数据增广，通过提供多样化的視觉效果来增强模型的泛化能力。
+            torchvision.transforms.RandomPerspective(distortion_scale=0.6, p=1),
+            # kernel_size 参数定义了高斯卷积核的大小，其指定了运算窗口的大小。
+            # 它可能是一个整数或一个二元素元组。如果它是一个整数，那么水平和垂直方向上会有着同样的核大小。
+            # 如果它是一个元组，那么第一个元素是水平方向上的核大小，第二个元素是垂直方向上的核大小。
+            # 此处提供的是 kernel_size=(5, 9)，意味着高斯核的大小在水平方向是5，在垂直方向是9。
+            # sigma 参数定义了高斯滤波器中的标准差值，决定了滤波器或模糊的强度，可以是一个单一的浮点数或一个二元素元组
+            # 分别代表最小和最大可以使用的标准偏差。对于给定的图像，标准偏差会在配置的范围内随机选取。
+            # 在此处，它为 (0.1, 5)，意味着标准偏差的值会在0.1和5之间随机选取。
+            torchvision.transforms.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5)),
+            torchvision.transforms.ToTensor()
+        ])
+    else:
+        transform = torchvision.transforms.Compose([
+            torchvision.transforms.Resize(resize_size),
+            torchvision.transforms.ToTensor()
+        ])
+    return transform
 
-# train
+
+def build_dataset(is_train, dataset_folder) -> torchvision.datasets.ImageFolder:
+    """
+    is_train: 是否是训练集, 用来设置Transform是否需要数据增强
+    dataset_folder: 'train' 或 'test' 或 'validation'
+    """
+    global num_categories
+    transform = build_transform(is_train=is_train)
+    path = os.path.join(dataset_path, dataset_folder)
+    # 由于文件夹层级结构非常标准./category/n.png，直接用ImageFolder库
+    dataset = torchvision.datasets.ImageFolder(root=path, transform=transform)
+    info_dataset = dataset.find_classes(directory=path)
+    num_categories = len(info_dataset[0])
+    print(f"build_dataset({dataset_folder}): finding {len(info_dataset[0])} categories in {path}")
+    print(f"build_dataset({dataset_folder}): {info_dataset[1]}")
+    return dataset
+
+
+def build_dataloader(is_train, dataset) -> torch.utils.data.DataLoader:
+    """
+    is_train: 设定是随机取样还是逐个取样
+    """
+    dataloader = None
+    if is_train:
+        sampler = torch.utils.data.RandomSampler(data_source=dataset)
+        dataloader = torch.utils.data.DataLoader(
+            dataset=dataset, sampler=sampler, batch_size=batch_size,
+            # num_workers参数决定了有多少个子进程被用来加载数据。
+            # 如果num_workers=0，则数据将在主进程中加载，这可能会阻塞主进程的其他操作。
+            # 如果num_workers大于0，数据加载就会由这些子进程完成，可以在后台并行进行，大大提高了数据加载的速度。
+            num_workers=num_workers,
+            # pin_memory是一个布尔类型的参数，如果设置为True，DataLoader会在返回之前，将张量复制到CUDA固定内存(也称作pinned内存)中。
+            # 默认情况下，当你把一个在CPU上的Tensor送入GPU的时候，PyTorch总是会首先把它复制到一个pinned内存的buffer
+            # 然后CUDA才从那里异步的把它发送到GPU。如果你的数据在一开始就已经保存在pinned内存中了，那么这个额外的复制就可以被避免
+            # 从而可能会加速模型训练。
+            pin_memory=pin_memory,
+            drop_last=True
+        )
+    else:
+        sampler = torch.utils.data.SequentialSampler(data_source=dataset)
+        dataloader = torch.utils.data.DataLoader(
+            dataset=dataset, sampler=sampler, batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory,
+            drop_last=True
+        )
+    return dataloader
+
+
+def create_model(resnet=resnet_ver, layers=None):
+    model = None
+    if num_categories is None:
+        print("fatal error: calling create_model while dataset is not built")
+        exit(1)
+    assert isinstance(num_categories, int)
+    if layers is not None:
+        model = ResNetCustomize(image_channels=img_channels, num_classes=num_categories)
+    if resnet == 50:
+        model = ResNet50(image_channels=img_channels, num_classes=num_categories)
+    elif resnet == 101:
+        model = ResNet101(image_channels=img_channels, num_classes=num_categories)
+    elif resnet == 152:
+        model = ResNet152(image_channels=img_channels, num_classes=num_categories)
+    return model
+
+
+# 不需要计算梯度
+@torch.no_grad()
+def validation(model, dataloader_validation, loss_func):
+    """
+    topk: 对于每个样本，从模型的输出中选择概率最高的前 k 个类别。
+    检查真实标签是否在这 k 个类别中。如果是，则该样本被视为正确分类；否则，视为错误分类。
+    这个函数会计算top1和top5正确率
+    """
+    accumulate_acc1 = 0
+    accumulate_acc5 = 0
+    accumulate_loss = 0
+    accumulate_count = 0
+    for validation_index, validation_sample in enumerate(dataloader_validation):
+        accumulate_count += 1
+        validation_image, validation_gt_label = validation_sample
+        print(validation_gt_label)
+        torchvision.utils.save_image(tensor=validation_image, fp='./test.png')
+        validation_image = validation_image.to(device, non_blocking=True)
+        validation_gt_label = validation_gt_label.to(device, non_blocking=True)
+        # dim=-1代表在最后一个维度上进行计算，在这个计算中，因为validation_resnet_label.shape=(batch_size, categories_num)
+        # 所以dim=-1和dim=1是一样的，并且acc1和acc5都是精确度百分比
+        validation_resnet_label = nn.functional.softmax(model(x=validation_image), dim=-1)
+        loss = loss_func(validation_resnet_label, validation_gt_label)
+        # output: 模型的预测输出。通常是一个张量，表示模型的原始输出。该张量的形状应为 (batch_size, num_classes)
+        #   其中 batch_size 是批处理大小，num_classes 是分类的类别数。
+        # target: 真实的标签。通常是一个张量，表示每个样本的真实标签。该张量的形状应与 output 的形状相同。
+        # topk: 一个元组，用于指定计算前几个最高概率的类别。例如，topk=(1,) 表示计算最高概率的类别，topk=(1, 5)
+        #   表示同时计算最高概率和前五个最高概率的类别。
+        # 例如说batch_size=3，并且我们选取top1，对于第一个样例输入分类对了，第二个分类错了，第三个分类对了，
+        #   timm.utils.accuracy会输出0.667
+        # 代码例子：tensor1 = torch.Tensor([[1, 2, 3], [2,1,3]]); tensor2 = torch.Tensor([2, 1]); 第一个分类对了(2)，第二个错
+        # acc1, = timm.utils.accuracy(output=tensor1, target=tensor2, topk=(1, )) --> acc1.item() = 50.0
+        acc1, acc5 = timm.utils.accuracy(output=validation_resnet_label, target=validation_gt_label, topk=(1, 5))
+        accumulate_acc1 += acc1.item()
+        accumulate_acc5 += acc5.item()
+        accumulate_loss += loss.item()
+    # 最后再算一个所有batch的平均准确率
+    # print(f"validation result: acc1={accumulate_acc1/accumulate_count}%, acc5={accumulate_acc5/accumulate_count}%")
+    return {"acc1": accumulate_acc1 / accumulate_count, "acc5": accumulate_acc5 / accumulate_count,
+            "loss": accumulate_loss / accumulate_count}
+
+
+def train_epoch(model:nn.Module, loss_func:nn.Module, dataloader, optimizer:torch.optim.Optimizer, device:torch.device,
+                epoch: int, max_norm: float=0, log_writer=None):
+    model.train()
+
+    
+
+
+def main():
+    dataset = build_dataset(is_train=True, dataset_folder='train')
+    dataloader = build_dataloader(is_train=True, dataset=dataset)
+    dataset_validation = build_dataset(is_train=False, dataset_folder='validation')
+    dataloader_validation = build_dataloader(is_train=False, dataset=dataset_validation)
+    model = create_model().to(device)
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"ResNet{resnet_ver}: {n_parameters / 1.e6}M parameters. Model creation success")
+    loss_func = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(params=model.parameters(), lr=learn_rate, weight_decay=weight_decay)
+    os.makedirs(log_path, exist_ok=True)
+    log_writer = torch.utils.tensorboard.SummaryWriter(log_dir=log_path)
+    # 训练之前validate一下看看结果
+    model.eval()
+    validation_result = validation(model=model, dataloader_validation=dataloader_validation, loss_func=loss_func)
+    print(f"validation: acc1={validation_result['acc1']},acc5={validation_result['acc5']}, "
+          f"loss={validation_result['loss']}")
+    for epoch in range(num_epoch):
+        print(f"Epoch: {epoch}, len(dataloader)={len(dataloader)}", end='')
+        loss_list = []
+
+        # 每经过log_step就validate一次
+        if epoch % log_step == 0:
+            # 模型进入推理模式
+            model.eval()
+            validation_result = validation(model=model, dataloader_validation=dataloader_validation,
+                                           loss_func=loss_func)
+            # 写入TensorBoard的SummaryWriter
+            if log_writer is not None:
+                log_writer.add_scalar(tag="performance/validate_acc1", scalar_value=validation_result['acc1'],
+                                      global_step=epoch)
+                log_writer.add_scalar(tag="performance/validate_acc5", scalar_value=validation_result['acc5'],
+                                      global_step=epoch)
+                log_writer.add_scalar(tag="performance/validate_loss", scalar_value=validation_result['loss'],
+                                      global_step=epoch)
+            # 重回训练模式
+            model.train()
+            print(f"acc1={validation_result['acc1']},acc5={validation_result['acc5']}, "
+                  f"loss={validation_result['loss']}", end='')
+            print('\nStart Train...')
+
+        for index_minibatch, sample_minibatch in enumerate(dataloader):
+            # 梯度清零
+            optimizer.zero_grad()
+            # 提取data里面的数据和真实标签
+            batch_image, batch_gt_label = sample_minibatch
+            # non_blocking参数。这在转移大量数据时尤其有用，因为这允许主机CPU继续向GPU发送数据，而不必等待每次数据传送的完成。
+            # 这样在一些情况下可以提高总体的运行速度。然而，这倒不是通常需要担心的问题
+            # 因为对于大部分应用，数据传输的成本相对于模型计算的成本来说是微不足道的，除非你的模型非常简单
+            # 或者你在使用非常大的数据。因此，大多数情况下，你并不需要设置non_blocking=True。
+            batch_image.to(device, non_blocking=True)
+            batch_gt_label.to(device, non_blocking=True)
+            # 把batch_image传入model
+            batch_resnet_label = model(x=batch_image)
+            batch_loss = loss_func(batch_resnet_label, batch_gt_label)
+            batch_loss.backward()
+            optimizer.step()
+            loss_list.append(batch_loss)
+
+        loss_avg = torch.mean(torch.FloatTensor(loss_list))
+
+
+if __name__ == '__main__':
+    test_network()
+    main()
